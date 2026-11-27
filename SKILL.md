@@ -14,10 +14,12 @@ The goal is the method, not a copy. You keep your face, your words and your topi
 Run the measuring script on the link (Instagram, TikTok, YouTube Shorts, X) or on a local file:
 
 ```bash
-python3 <this skill>/scripts/measure_reel.py "<link or file>" --out reel-<name>
+<python> <this skill>/scripts/measure_reel.py "<link or file>" --out reel-<name>
 ```
 
-It takes 2 to 5 minutes for a 45 s video (most of it is the transcript). It downloads the video, transcribes it with word timings, runs HyperFrames' free local measuring commands (cuts, events, face, audio), and writes:
+`<python>` is the Python where `requirements.txt` is installed (the skill's `.venv/bin/python` if you followed the README). HyperFrames needs Node 22+; with an older Node the script says so and goes on without the face box and the sound reading.
+
+It takes 1 to 4 minutes for a 45 s video (most of it is the transcript; the first run also downloads the whisper model). It downloads the video, transcribes it with word timings, runs HyperFrames' free local measuring commands (cuts, face, audio), scans every region of the frame for changes (fades, morphs and slides included), and writes:
 
 - `summary.md`: every measured number. Read it first.
 - `sheets/layout-grid.png`: hook, middle and end frames with a line every 10%.
@@ -32,9 +34,10 @@ If the download fails (private post, login wall), ask the person to save the vid
 Open the sheets and name every layer: the speaker or main footage, the title, the captions, cards or pictures, b-roll or gameplay, stickers, progress bars, emoji. For each one:
 
 - **Position and size** as a share of the frame, read on `layout-grid.png` (lines every 10%). A text's size is its cap height as a share of the frame height.
-- **When it is on screen**: from the change table in `summary.md` (time, place, word spoken). A short gap (0.1 to 0.5 s) between two changes in the same place is usually one card leaving before the next one enters.
-- **How it enters and leaves**, on `entrances.png` (one column per frame): visible in full on the first frame = hard cut; growing over 2 to 5 frames = pop or scale; moving in from an edge = slide; see-through first = fade.
+- **When it is on screen**: from the change table in `summary.md` (time, kind, transition, place, word spoken). A short gap (0.1 to 0.5 s) between two changes in the same place is usually one card leaving before the next one enters. A "whole-frame change" is a camera cut only if the speaker is on both sides; otherwise it is a full-screen graphic. If the overview sheet shows a change the table misses, add it.
+- **How it enters and leaves**, on `entrances.png` (one row per change, one column per frame): visible in full on the first frame = hard cut; growing over 2 to 5 frames = pop or scale; moving in from an edge = slide; see-through first = fade.
 - **Style**: font family (name the closest free font: Montserrat, Inter, Poppins, Anton, Bebas Neue...), weight, colour, outline, shadow or box, words per caption.
+- **Words**: whisper gets names wrong ("Verscel" for Vercel). Correct product and tool names from the text on screen before quoting the script.
 
 Need a closer look? HyperFrames' tools are free and local (`npx -y hyperframes@0.9.9 measure --help`):
 - `measure frames <video> --range a,b --max 12` for consecutive frames of any moment
@@ -56,7 +59,9 @@ Give the recipe in the chat (short), save it as `recipe.md` next to `summary.md`
 
 ## Limits
 
-- The face box is sampled 12 times, so a quick punch-in between samples can be missed: check the changes sheet.
+- The face box comes from about 10 sampled frames and can sit a few % off: confirm it on the grid. A quick punch-in between samples can be missed: check the changes sheet.
+- Gradual changes are timed to about 0.1 s; hard cuts are frame-exact.
+- The music verdict says how many seconds of pauses it rests on; under 3 s, listen to it.
 - Sound hits are found between words only; an SFX under the voice is not listed.
 - Fonts are matched by eye.
 - Videos you are not allowed to download stay out: use your own screen recording of the post if the platform allows it, or skip it.

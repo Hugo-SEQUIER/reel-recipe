@@ -30,7 +30,7 @@ from pathlib import Path
 
 try:
     import numpy as np
-    from PIL import Image, ImageChops, ImageDraw, ImageFont, ImageStat
+    from PIL import Image, ImageDraw, ImageFont
 except ImportError:
     sys.exit("Missing Python packages: pip install -r requirements.txt (Pillow, numpy, faster-whisper)")
 
@@ -178,10 +178,12 @@ def audio_bed(audio, words):
     if s is None or g is None:
         return None
     diff = s - g
+    pause_seconds = round(sum(c.size for c in gaps) / sr, 1)
     verdict = ("music or sound under the voice" if diff < 20 else
                "quiet bed under the voice (low music or room tone)" if diff < 32 else
                "voice only, silent between words")
-    return {"speech_db": round(s, 1), "gaps_db": round(g, 1), "gap_below_speech_db": round(diff, 1), "verdict": verdict}
+    return {"speech_db": round(s, 1), "gaps_db": round(g, 1), "gap_below_speech_db": round(diff, 1), "verdict": verdict,
+            "pause_seconds": pause_seconds}
 
 
 # ---------- 4. HyperFrames measuring commands (free, local, no sign-in) ----------
@@ -189,6 +191,15 @@ def audio_bed(audio, words):
 def hf_cmd():
     if os.environ.get("HYPERFRAMES_BIN"):
         return [os.environ["HYPERFRAMES_BIN"]]
+    node = shutil.which("node")
+    if not node:
+        log("Node not found: skipping HyperFrames (install Node 22+); cuts come from ffmpeg, no face box or sound reading")
+        return None
+    v = run([node, "-v"]).stdout.strip().lstrip("v")
+    if not v or int(v.split(".")[0]) < 22:
+        log(f"Node {v or '?'} is too old for HyperFrames (needs 22+): skipping it; cuts come from ffmpeg, "
+            "no face box or sound reading")
+        return None
     if shutil.which("hyperframes"):
         return ["hyperframes"]
     if shutil.which("npx"):
@@ -208,7 +219,6 @@ def hf_json(base, args, cwd):
 def hyperframes(video, out):
     base = hf_cmd()
     if not base:
-        log("Node/npx not found: skipping HyperFrames, cuts come from ffmpeg only")
         return {}
     res = {}
     for key, args in {
@@ -237,10 +247,25 @@ def ffmpeg_cuts(video):
 
 # ---------- 5. frames ----------
 
-def grab(video, t, path, width=360):
-    run(["ffmpeg", "-v", "error", "-y", "-ss", f"{max(t, 0):.3f}", "-i", str(video), "-frames:v", "1",
-         "-vf", f"scale={width}:-2", str(path)])
+def frame_path(out, n, width):
+    return out / "frames" / f"n{n:05d}w{width}.png"
+
+
+def grab_n(video, n, fps, out, width=360):
+    """Frame number n, exactly: input seeking keeps the first frame at or after the seek time,
+    so seek a quarter frame before it. Cached by frame number and width."""
+    path = frame_path(out, n, width)
+    if not path.exists():
+        run(["ffmpeg", "-v", "error", "-y", "-ss", f"{max((n - 0.25) / fps, 0):.4f}", "-i", str(video),
+             "-frames:v", "1", "-vf", f"scale={width}:-2", str(path)])
     return path if path.exists() else None
+
+
+def grab_many(video, items, fps, out):
+    """items: list of (frame number, width). Runs the ffmpeg seeks in parallel."""
+    from concurrent.futures import ThreadPoolExecutor
+    with ThreadPoolExecutor(max_workers=min(8, os.cpu_count() or 4)) as ex:
+        return list(ex.map(lambda it: grab_n(video, it[0], fps, out, it[1]), items))
 
 
 def font(size):
@@ -282,16 +307,41 @@ def sheet(images, labels, path, cols=6):
     canvas.save(path)
 
 
-def region_change(a, b):
-    """Mean grey change per grid cell between two frames."""
-    ga = Image.open(a).convert("L").resize((GX * 30, GY * 30))
-    gb = Image.open(b).convert("L").resize((GX * 30, GY * 30))
-    diff = ImageChops.difference(ga, gb)
-    cells = {}
-    for r in range(GY):
-        for c in range(GX):
-            cells[(r, c)] = ImageStat.Stat(diff.crop((c * 30, r * 30, (c + 1) * 30, (r + 1) * 30))).mean[0]
-    return cells
+# ---------- 6. where things change ----------
+# The video is decoded once, small and grey, at SCAN_FPS. Each frame is cut in GX x GY cells.
+
+SCAN_FPS, CELL = 10, 18
+LAG = 4  # frames at SCAN_FPS between the two pictures compared (0.4 s): long enough to catch fades and morphs
+
+
+def decode_small(video):
+    w, h = GX * CELL, GY * CELL
+    r = subprocess.run(["ffmpeg", "-v", "error", "-i", str(video), "-vf",
+                        f"fps={SCAN_FPS},scale={w}:{h},format=gray", "-f", "rawvideo", "-"], capture_output=True)
+    a = np.frombuffer(r.stdout, np.uint8)
+    return a[: a.size // (w * h) * (w * h)].reshape(-1, h, w).astype(np.float32)
+
+
+def cell_means(d):
+    """(N, H, W) absolute differences -> (N, GY, GX) mean per cell."""
+    return d.reshape(d.shape[0], GY, CELL, GX, CELL).mean(axis=(2, 4))
+
+
+def largest_block(cells):
+    """Keep the largest 4-connected group of cells (drops lone cells such as a moving hand)."""
+    cells, best = set(cells), set()
+    while cells:
+        stack, group = [cells.pop()], set()
+        while stack:
+            r, c = stack.pop()
+            group.add((r, c))
+            for nb in ((r + 1, c), (r - 1, c), (r, c + 1), (r, c - 1)):
+                if nb in cells:
+                    cells.remove(nb)
+                    stack.append(nb)
+        if len(group) > len(best):
+            best = group
+    return best
 
 
 def span(cells):
@@ -301,33 +351,53 @@ def span(cells):
             f"x {cols[0] * 100 // GX}-{(cols[-1] + 1) * 100 // GX}%")
 
 
-def describe_cells(cells, face_cells, baseline, thr=10):
-    """Kind and place of a change. A cell counts only when it moves well above its usual motion
-    (gameplay, b-roll and a talking mouth move all the time and would hide the real change)."""
-    changed = [k for k, v in cells.items() if v >= max(thr, baseline.get(k, 0) * 2.5 + 6)]
+def scan_changes(small, ignore):
+    """Times where a region changes far above its usual motion, including fades and morphs that a
+    hard-cut detector misses. Returns the per-cell threshold too, for classifying the changes."""
+    if small.shape[0] <= LAG + 2:
+        return [], None
+    D = cell_means(np.abs(small[LAG:] - small[:-LAG]))      # change over 0.4 s, index i = frames i..i+LAG
+    D1 = cell_means(np.abs(small[1:] - small[:-1]))          # change frame to frame
+    thr = np.maximum(10, np.median(D, axis=0) * 2.5 + 6)
+    active = D > thr
+    mask = np.ones((GY, GX), bool)
+    for r, c in ignore:
+        mask[r, c] = False
+    score = (active & mask).sum(axis=(1, 2))
+    events, i = [], 0
+    while i < len(score):
+        if score[i] >= 2:
+            j = i
+            while j + 1 < len(score) and score[j + 1] >= 2:
+                j += 1
+            cells = active[i:j + 1].any(axis=0) & mask
+            # the frame where those cells move the most is the change itself
+            lo, hi = i, min(j + LAG, len(D1) - 1)
+            strength = D1[lo:hi + 1][:, cells].mean(axis=1)
+            k = lo + int(np.argmax(strength))
+            peak = strength.max()
+            moving = int((strength > max(3.0, peak * 0.35)).sum())
+            events.append({"t": round((k + 1) / SCAN_FPS, 3), "scan_frames": moving})
+            i = j + 1
+        else:
+            i += 1
+    return events, thr
+
+
+def classify(small, t, thr, face_cells, ignore):
+    k = int(round(t * SCAN_FPS))
+    a, b = max(k - LAG // 2, 0), min(k + LAG // 2, small.shape[0] - 1)
+    d = cell_means(np.abs(small[b:b + 1] - small[a:a + 1]))[0]
+    changed = {(r, c) for r in range(GY) for c in range(GX) if d[r, c] > thr[r, c]}
     if not changed:
         return "small change", ""
     share = len(changed) / (GX * GY)
     if share >= 0.75:
-        kind = "camera cut or full-screen change"
-    elif face_cells and all(k in changed for k in face_cells) and share >= 0.4:
-        kind = "camera cut, punch-in or move"
-    else:
-        kind = "overlay change (text, card, picture)"
-    return kind, span(changed)
-
-
-def motion_baseline(video, duration, fps, tmp, samples=16):
-    """Usual frame-to-frame motion per cell, from pairs of frames 2 frames apart spread over the video."""
-    per_cell = {}
-    for i in range(samples):
-        t = duration * (i + 0.5) / samples
-        a = grab(video, t, tmp / f"b{i:02d}a.png", width=240)
-        b = grab(video, t + 2 / fps, tmp / f"b{i:02d}b.png", width=240)
-        if a and b:
-            for k, v in region_change(a, b).items():
-                per_cell.setdefault(k, []).append(v)
-    return {k: statistics.median(v) for k, v in per_cell.items()}
+        return "whole-frame change (camera cut or full-screen graphic)", "y 0-100%, x 0-100%"
+    if face_cells and face_cells <= changed and share >= 0.4:
+        return "camera cut, punch-in or move", span(changed)
+    block = largest_block(changed - set(ignore)) or largest_block(changed)
+    return "overlay change (text, card, picture)", span(block)
 
 
 # ---------- main ----------
@@ -366,90 +436,122 @@ def main():
 
     hf = {} if a.no_hyperframes else hyperframes(video, out)
 
-    # visual changes: HyperFrames' cut list (catches card swaps and jump cuts), else ffmpeg scene changes
-    if hf.get("cuts", {}).get("cuts") is not None:
-        change_times = [c["t"] for c in hf["cuts"]["cuts"]]
-        flashes = [n["t"] for n in hf["cuts"].get("not_cuts", [])]
-        change_source = f"hyperframes measure cuts {HF_VERSION}"
-    else:
-        change_times, flashes, change_source = ffmpeg_cuts(video), [], "ffmpeg scene score (misses small overlays)"
+    fps = p["fps"] or 30
+    n_frames = int(p["duration"] * fps)
 
-    # face position (where the person sits in the frame)
+    def frame_of(t):
+        return max(0, min(n_frames - 1, int(round(t * fps))))
+
+    # face position (where the person sits in the frame) and the body under it
     face = hf.get("face") or {}
-    face_box, face_cells, face_steady = None, set(), None
+    face_box, face_cells, body_cells, face_steady = None, set(), set(), None
     boxes = [b["box"] for b in face.get("boxes", []) if b.get("box")]
     if boxes:
         face_box = [round(statistics.median(b[i] for b in boxes), 3) for i in range(4)]
+        x, y, w, h = face_box
         cx = [b[0] + b[2] / 2 for b in boxes]
         cy = [b[1] + b[3] / 2 for b in boxes]
         hs = [b[3] for b in boxes]
-        face_steady = (max(cx) - min(cx) < 0.06 and max(cy) - min(cy) < 0.06 and max(hs) / min(hs) < 1.2)
-        x, y, w, h = face_box
+        # the detector's box jitters by a few %, so judge moves against the face's own size
+        face_steady = (max(cx) - min(cx) < 0.35 * w and max(cy) - min(cy) < 0.35 * h and max(hs) / min(hs) < 1.35)
+        fcx = x + w / 2
         for r in range(GY):
             for c in range(GX):
-                cx0, cy0 = c / GX, r / GY
-                if cx0 < x + w and cx0 + 1 / GX > x and cy0 < y + h and cy0 + 1 / GY > y:
+                x0, y0 = c / GX, r / GY
+                if x0 < x + w and x0 + 1 / GX > x and y0 < y + h and y0 + 1 / GY > y:
                     face_cells.add((r, c))
+                elif y0 + 1 / GY > y + h and x0 < fcx + 1.25 * w and x0 + 1 / GX > fcx - 1.25 * w:
+                    body_cells.add((r, c))
 
-    # usual motion per region: regions that always move are gameplay, b-roll or the speaker
-    fps = p["fps"] or 30
-    baseline = motion_baseline(video, p["duration"], fps, out / "frames")
-    always = [k for k, v in baseline.items() if v >= 6 and k not in face_cells]
+    # usual motion per region, from the whole video decoded small
+    log("scanning every region for changes")
+    small = decode_small(video)
+    if small.shape[0] > LAG:
+        usual = np.median(cell_means(np.abs(small[LAG:] - small[:-LAG])), axis=0)
+    else:
+        usual = np.zeros((GY, GX))
+    always = [(r, c) for r in range(GY) for c in range(GX)
+              if usual[r, c] >= 6 and (r, c) not in face_cells | body_cells]
+    ignore = face_cells | body_cells | set(always)
+    scanned, thr = scan_changes(small, ignore)
 
-    # before/after frames around every change, classified by where the pixels moved
-    changes, pair_imgs, pair_labels = [], [], []
-    prev = 0.0
-    for i, t in enumerate(change_times):
-        before = grab(video, t - 2 / fps, out / "frames" / f"c{i:02d}a.png")
-        after = grab(video, t + 2 / fps, out / "frames" / f"c{i:02d}b.png")
-        kind, where = ("unknown", "")
-        if before and after:
-            kind, where = describe_cells(region_change(before, after), face_cells, baseline)
-            pair_imgs += [before, after]
-            pair_labels += [f"{t:.2f}s before", f"after: {word_at(words, t)}"]
-        changes.append({"t": t, "since_previous": round(t - prev, 2), "kind": kind, "where": where,
-                        "word": word_at(words, t)})
-        prev = t
+    # hard cuts from HyperFrames (frame-exact) + changes only the region scan sees (fades, morphs, slides)
+    if hf.get("cuts", {}).get("cuts") is not None:
+        hard = [(c["t"], c.get("frame", frame_of(c["t"]))) for c in hf["cuts"]["cuts"]]
+        flashes = [n["t"] for n in hf["cuts"].get("not_cuts", [])]
+        change_source = f"hyperframes measure cuts {HF_VERSION} + region scan"
+    else:
+        hard = [(t, frame_of(t)) for t in ffmpeg_cuts(video)]
+        flashes, change_source = [], "ffmpeg scene score + region scan"
+    found = [{"t": round(t, 3), "frame": n, "transition": "hard cut"} for t, n in hard]
+    for e in scanned:
+        if all(abs(e["t"] - c["t"]) > 0.35 for c in found):
+            speed = (f"gradual, about {e['scan_frames'] / SCAN_FPS:.1f} s (fade, morph or slide)"
+                     if e["scan_frames"] >= 3 else "fast, under 0.2 s")
+            found.append({"t": e["t"], "frame": frame_of(e["t"]), "transition": speed})
+    found.sort(key=lambda c: c["t"])
+
+    changes, prev = [], 0.0
+    for c in found:
+        kind, where = classify(small, c["t"], thr, face_cells, ignore) if thr is not None else ("unknown", "")
+        if kind == "small change" and c["transition"] != "hard cut":
+            continue
+        changes.append({**c, "since_previous": round(c["t"] - prev, 2), "kind": kind, "where": where,
+                        "word": word_at(words, c["t"])})
+        prev = c["t"]
+
+    # every picture we need, extracted in parallel
+    log("extracting frames")
+    pair_jobs, ent_jobs, grid_jobs, ov_jobs = [], [], [], []
+    for c in changes:
+        gap = 2 if c["transition"] == "hard cut" else int(0.3 * fps)
+        pair_jobs.append(((max(c["frame"] - gap, 0), 360), (min(c["frame"] + gap, n_frames - 1), 360)))
+    seen, ent_pick = set(), []
+    for c in changes:
+        key = (c["kind"], c["transition"].split(",")[0], c["where"][:4])
+        if key not in seen and len(ent_pick) < 4:
+            seen.add(key)
+            ent_pick.append(c)
+    offsets = (-1, 0, 1, 2, 3, 5, 8, 12)
+    for c in ent_pick:
+        ent_jobs += [(min(max(c["frame"] + k, 0), n_frames - 1), 240) for k in offsets]
+    marks = [min(1.0, p["duration"] / 4), p["duration"] / 2, max(0, p["duration"] - 1.5)]
+    if changes:
+        marks[1] = changes[len(changes) // 2]["t"] + 0.4
+    grid_jobs = [(frame_of(t), 540) for t in marks]
+    ov_times = [min(s + 0.5, p["duration"] - 0.05) for s in range(int(p["duration"]) + 1)]
+    ov_jobs = [(frame_of(t), 270) for t in ov_times]
+    grab_many(video, [j for pair in pair_jobs for j in pair] + ent_jobs + grid_jobs + ov_jobs, fps, out)
+
+    def fp(job):
+        path = frame_path(out, *job)
+        return path if path.exists() else None
+
+    pair_imgs, pair_labels = [], []
+    for c, (a_job, b_job) in zip(changes, pair_jobs):
+        if fp(a_job) and fp(b_job):
+            pair_imgs += [fp(a_job), fp(b_job)]
+            pair_labels += [f"{c['t']:.2f}s before", f"after: {c['word']}"]
     for n in range(0, len(pair_imgs), 12):
         sheet(pair_imgs[n:n + 12], pair_labels[n:n + 12], out / "sheets" / f"changes-{n // 12 + 1}.png")
 
-    # entrances: consecutive frames around the first changes of each place, to see cut vs pop vs slide vs fade
-    seen, ent_imgs, ent_labels = set(), [], []
-    for i, c in enumerate(changes):
-        if c["where"] in seen or len(seen) >= 4:
-            continue
-        seen.add(c["where"])
-        for k in (-1, 0, 1, 2, 3, 5, 8, 12):
-            t = c["t"] + k / fps
-            f = grab(video, t, out / "frames" / f"e{i:02d}_{k + 1:02d}.png", width=240)
-            if f:
-                ent_imgs.append(f)
+    ent_imgs, ent_labels = [], []
+    for i, c in enumerate(ent_pick):
+        for k, job in zip(offsets, ent_jobs[i * len(offsets):(i + 1) * len(offsets)]):
+            if fp(job):
+                ent_imgs.append(fp(job))
                 ent_labels.append(f"{c['t']:.2f}s {k:+d}f")
     if ent_imgs:
         sheet(ent_imgs, ent_labels, out / "sheets" / "entrances.png", cols=8)
 
-    # layout: hook, middle and end frames at 540 px with a 10% grid
-    marks = [min(1.0, p["duration"] / 4), p["duration"] / 2, max(0, p["duration"] - 1.5)]
-    if changes:
-        marks[1] = changes[len(changes) // 2]["t"] + 0.4
-    grids = []
-    for j, t in enumerate(marks):
-        f = grab(video, t, out / "frames" / f"g{j}.png", width=540)
-        if f:
-            grids.append(grid_frame(f, out / "frames" / f"g{j}_grid.png"))
+    grids = [grid_frame(fp(j), out / "frames" / f"grid{j[0]:05d}.png") for j in grid_jobs if fp(j)]
     if grids:
         sheet(grids, [f"{t:.1f}s (lines every 10%)" for t in marks], out / "sheets" / "layout-grid.png", cols=3)
 
-    # overview: one frame per second
-    ov, ov_labels = [], []
-    for s in range(int(p["duration"]) + 1):
-        t = min(s + 0.5, p["duration"] - 0.05)
-        f = grab(video, t, out / "frames" / f"o{s:03d}.png", width=270)
-        if f:
-            ov.append(f)
-            ov_labels.append(f"{t:.1f}s {word_at(words, t)}")
+    ov = [(fp(j), f"{t:.1f}s {word_at(words, t)}") for j, t in zip(ov_jobs, ov_times) if fp(j)]
     for n in range(0, len(ov), 24):
-        sheet(ov[n:n + 24], ov_labels[n:n + 24], out / "sheets" / f"overview-{n // 24 + 1}.png")
+        part = ov[n:n + 24]
+        sheet([x for x, _ in part], [y for _, y in part], out / "sheets" / f"overview-{n // 24 + 1}.png")
 
     # sound
     hfa = (hf.get("audio") or {}).get("items", [{}])[0] if hf.get("audio") else {}
@@ -470,8 +572,8 @@ def main():
         "change_source": change_source,
         "changes": changes,
         "flashes": flashes,
-        "whole_frame_cuts": (hf.get("events") or {}).get("counts", {}).get("cut"),
-        "face": {"box_median": face_box, "height_share": face.get("face_height"), "steady": face_steady},
+        "face": {"box_median": face_box, "height_share": face.get("face_height"), "steady": face_steady,
+                 "samples": len(face.get("boxes", [])), "found_in": len(boxes)},
         "always_moving": span(always) if always else "",
         "speech": {
             "words": len(words),
@@ -500,6 +602,8 @@ def render_summary(m, tr):
         for k in ["source", "author", "date", "views", "likes", "comments"]:
             if i.get(k) is not None:
                 L.append(f"- {k}: {i[k]}")
+            elif k == "views" and i.get("likes") is not None:
+                L.append("- views: not given by the platform (read them on the post)")
         if i.get("caption"):
             L.append(f"- caption: {i['caption'].splitlines()[0][:200]}")
         L.append("")
@@ -508,25 +612,27 @@ def render_summary(m, tr):
     f = m["face"]
     if f["box_median"]:
         x, y, w, h = f["box_median"]
-        L.append(f"- face: x {pct(x)}-{pct(x + w)}, y {pct(y)}-{pct(y + h)} of the frame, face height {pct(f['height_share'] or h)} of the frame; "
+        L.append(f"- face: x {pct(x)}-{pct(x + w)}, y {pct(y)}-{pct(y + h)} of the frame, face height {pct(f['height_share'] or h)} of the frame "
+                 f"(found in {f['found_in']} of {f['samples']} sampled frames; the detector box can sit a few % off, confirm on the grid); "
                  + ("same framing all video (no punch-ins between samples)" if f["steady"] else "framing moves: check for punch-ins and zooms"))
     else:
         L.append("- face: none found (no person, or HyperFrames not run)")
     if m["always_moving"]:
-        L.append(f"- region that moves all the time outside the face (gameplay, b-roll, screen recording?): {m['always_moving']}")
+        L.append(f"- region that moves all the time away from the speaker (gameplay, b-roll, screen recording, or the speaker's hands): {m['always_moving']}")
     s = m["speech"]
     if s["words"]:
         L.append(f"- speech: {s['words']} words, {s['words_per_second']} words/s, first word at {s['first_word_at']} s")
         L.append(f"- first 3 s spoken: \"{s['hook_first_3s']}\"")
     L.append("")
     L.append(f"## Visual changes ({len(m['changes'])}, from {m['change_source']})")
-    if m["whole_frame_cuts"] is not None:
-        L.append(f"- whole-frame camera cuts found by `measure events`: {m['whole_frame_cuts']}")
+    L.append("- hard cuts are frame-exact; the region scan adds fades, morphs and slides (timed to about 0.1 s)")
     kinds = {}
     for c in m["changes"]:
         kinds[c["kind"]] = kinds.get(c["kind"], 0) + 1
     for k, n in kinds.items():
         L.append(f"- {k}: {n}")
+    if any(k.startswith("whole-frame") for k in kinds):
+        L.append("  (a whole-frame change is a camera cut only if the speaker is on both sides: check the changes sheet)")
     gaps = [c["since_previous"] for c in m["changes"][1:]]
     if gaps:
         L.append(f"- time between changes: median {statistics.median(gaps):.2f} s, shortest {min(gaps):.2f} s, longest {max(gaps):.2f} s")
@@ -535,10 +641,10 @@ def render_summary(m, tr):
     if m["flashes"]:
         L.append(f"- flashes (one-frame light changes, not cuts): {', '.join(str(t) for t in m['flashes'])}")
     L.append("")
-    L.append("| t (s) | since previous | kind | where | word spoken |")
-    L.append("|---|---|---|---|---|")
+    L.append("| t (s) | since previous | kind | transition | where | word spoken |")
+    L.append("|---|---|---|---|---|---|")
     for c in m["changes"]:
-        L.append(f"| {c['t']} | {c['since_previous']} | {c['kind']} | {c['where']} | {c['word']} |")
+        L.append(f"| {c['t']} | {c['since_previous']} | {c['kind']} | {c['transition']} | {c['where']} | {c['word']} |")
     L.append("")
     so = m["sound"]
     L.append("## Sound")
@@ -548,7 +654,8 @@ def render_summary(m, tr):
         L.append(f"- loudness: {so['loudness_lufs']} LUFS integrated")
     if so["bed"]:
         b = so["bed"]
-        L.append(f"- between words: {b['gaps_db']} dB vs speech {b['speech_db']} dB ({b['gap_below_speech_db']} dB lower): {b['verdict']}")
+        L.append(f"- between words: {b['gaps_db']} dB vs speech {b['speech_db']} dB ({b['gap_below_speech_db']} dB lower): {b['verdict']}"
+                 f" (from {b['pause_seconds']} s of pauses{'; low confidence, listen to it' if b['pause_seconds'] < 3 else ''})")
     if so["hits_between_words"]:
         L.append(f"- sound hits between words (possible SFX, whoosh or beat): {', '.join(str(t) for t in so['hits_between_words'][:30])}")
     elif so["kind"]:

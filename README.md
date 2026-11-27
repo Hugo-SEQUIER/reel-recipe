@@ -14,13 +14,16 @@ Works with any agent that reads `SKILL.md` files (Claude Code, Codex, Hermes, Op
 git clone https://github.com/Hugo-SEQUIER/reel-recipe
 # Claude Code: put it where your skills live
 cp -r reel-recipe ~/.claude/skills/reel-recipe
-pip install -r reel-recipe/requirements.txt
+cd ~/.claude/skills/reel-recipe
+python3 -m venv .venv && .venv/bin/pip install -r requirements.txt   # or: uv venv && uv pip install -r requirements.txt
 ```
+
+Run the script with that venv's Python (`.venv/bin/python scripts/measure_reel.py ...`). The first run downloads the whisper speech model once (about 500 MB for `small`; pass `--model base` for a lighter one).
 
 Also needed:
 - **ffmpeg** (with ffprobe)
 - **yt-dlp** to download links (`pip install yt-dlp`, or have `uvx`)
-- **Node 18+** for HyperFrames' measuring commands (run through `npx`, free, local, no account)
+- **Node 22+** for HyperFrames' measuring commands (run through `npx`, free, local, no account). With an older Node the script still runs, but without the face box and the sound reading.
 
 ## Use
 
@@ -31,7 +34,7 @@ Ask your agent:
 Or run the measuring step yourself:
 
 ```bash
-python3 scripts/measure_reel.py "https://www.instagram.com/p/..." --out reel-quiz
+.venv/bin/python scripts/measure_reel.py "https://www.instagram.com/p/..." --out reel-quiz
 ```
 
 Then open `reel-quiz/summary.md` and the pictures in `reel-quiz/sheets/`.
@@ -41,7 +44,7 @@ Then open `reel-quiz/summary.md` and the pictures in `reel-quiz/sheets/`.
 `summary.md`, measured:
 - size, frame rate, length
 - where the face sits and whether the framing ever changes
-- every visual change with its time, its place in the frame, the word spoken at that moment, and whether it is a camera cut or an overlay (card, text, picture)
+- every visual change with its time, its place in the frame, the word spoken at that moment, whether it is a hard cut or a gradual change (fade, morph, slide), and whether it is an overlay (card, text, picture) or a whole-frame change
 - regions that move all the time (gameplay, b-roll)
 - words per second and the first 3 seconds spoken
 - music under the voice or not, loudness, sound hits between words
