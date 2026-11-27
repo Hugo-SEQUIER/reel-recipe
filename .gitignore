@@ -1,0 +1,4 @@
+reel-*/
+__pycache__/
+.venv/
+.hyperframes/
